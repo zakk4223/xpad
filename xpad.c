@@ -71,6 +71,9 @@
 #include <linux/usb/quirks.h>
 
 #define XPAD_PKT_LEN 64
+#define XPAD_ELITE_NUM_PROFILES 3
+#define XPAD_ELITE_PROFILE_BASE 0x1d
+
 
 /*
  * xbox d-pads should map to buttons, as is required for DDR pads
@@ -80,6 +83,7 @@
 #define MAP_TRIGGERS_TO_BUTTONS		(1 << 1)
 #define MAP_STICKS_TO_NULL		(1 << 2)
 #define MAP_SELECT_BUTTON		(1 << 3)
+#define MAP_BACK_PADDLES		(1 << 4)
 #define DANCEPAD_MAP_CONFIG	(MAP_DPAD_TO_BUTTONS |			\
 				MAP_TRIGGERS_TO_BUTTONS | MAP_STICKS_TO_NULL)
 
@@ -128,7 +132,7 @@ static const struct xpad_device {
 	{ 0x045e, 0x0291, "Xbox 360 Wireless Receiver (XBOX)", MAP_DPAD_TO_BUTTONS, XTYPE_XBOX360W },
 	{ 0x045e, 0x02d1, "Microsoft X-Box One pad", 0, XTYPE_XBOXONE },
 	{ 0x045e, 0x02dd, "Microsoft X-Box One pad (Firmware 2015)", 0, XTYPE_XBOXONE },
-	{ 0x045e, 0x02e3, "Microsoft X-Box One Elite pad", 0, XTYPE_XBOXONE },
+	{ 0x045e, 0x02e3, "Microsoft X-Box One Elite pad", MAP_BACK_PADDLES, XTYPE_XBOXONE },
 	{ 0x045e, 0x02ea, "Microsoft X-Box One S pad", 0, XTYPE_XBOXONE },
 	{ 0x045e, 0x0719, "Xbox 360 Wireless Receiver", MAP_DPAD_TO_BUTTONS, XTYPE_XBOX360W },
 	{ 0x045e, 0x0b12, "Microsoft Xbox One X pad", MAP_SELECT_BUTTON, XTYPE_XBOXONE },
@@ -389,6 +393,14 @@ static const signed short xpad_abs_triggers[] = {
 	-1
 };
 
+
+/* used when Elite paddles are mapped to independent buttons */
+static const signed short xpadelite_btn_paddles[] = {
+	BTN_BASE, BTN_BASE2,
+	BTN_BASE3, BTN_BASE4,
+	-1
+};
+
 /*
  * Xbox 360 has a vendor-specific class, so we cannot match it with only
  * USB_INTERFACE_INFO (also specifically refused by USB subsystem), so we
@@ -574,6 +586,15 @@ struct xpad_output_packet {
 				 IS_ENABLED(CONFIG_JOYSTICK_XPAD_FF) + \
 				 IS_ENABLED(CONFIG_JOYSTICK_XPAD_LEDS))
 
+
+struct xpad_elite_profile {
+	u8 base_btn_map;
+	u8 base2_btn_map;
+	u8 base3_btn_map;
+	u8 base4_btn_map;
+};
+
+
 struct usb_xpad {
 	struct input_dev *dev;		/* input device interface */
 	struct input_dev __rcu *x360w_dev;
@@ -608,6 +629,7 @@ struct usb_xpad {
 	int mapping;			/* map d-pad to buttons or to axes */
 	int xtype;			/* type of xbox device */
 	int pad_nr;			/* the order x360 pads were attached */
+	struct xpad_elite_profile elite_profiles[XPAD_ELITE_NUM_PROFILES];	/*Elite profile for paddle map state */
 	const char *name;		/* name of the device */
 	struct work_struct work;	/* init/remove device from callback */
 	time64_t mode_btn_down_ts;
@@ -617,6 +639,8 @@ static int xpad_init_input(struct usb_xpad *xpad);
 static void xpad_deinit_input(struct usb_xpad *xpad);
 static void xpadone_ack_mode_report(struct usb_xpad *xpad, u8 seq_num);
 static void xpad360w_poweroff_controller(struct usb_xpad *xpad);
+static int xpadone_get_profile_data(struct usb_xpad *xpad, int profile_num);
+
 
 /*
  *	xpad_process_packet
@@ -851,6 +875,32 @@ static void xpad360w_process_packet(struct usb_xpad *xpad, u16 cmd, unsigned cha
 		xpad360_process_packet(xpad, dev, cmd, &data[4]);
 	rcu_read_unlock();
 }
+/*
+ * 	xpadone_process_profile_packet
+ *
+ * 	Extract the paddle mapping info from an Elite controller profile
+ *
+ */
+static void xpadone_process_profile_packet(struct usb_xpad *xpad, unsigned char *data)
+{
+        unsigned char cmd = data[4];
+
+        if (cmd == 0x02) { /* Profile data */
+                int profile_num = data[6] - XPAD_ELITE_PROFILE_BASE;
+                if (profile_num >= 0)
+                {
+                        xpad->elite_profiles[profile_num].base_btn_map = data[8] & 0x0F;
+                        xpad->elite_profiles[profile_num].base2_btn_map = data[8] & 0xF0;
+                        xpad->elite_profiles[profile_num].base3_btn_map = data[9] & 0x0F;
+                        xpad->elite_profiles[profile_num].base4_btn_map = data[9] & 0xF0;
+                        if (profile_num < XPAD_ELITE_NUM_PROFILES)
+                        {
+                                xpadone_get_profile_data(xpad, profile_num+1);
+                        }
+                }
+        }
+}
+
 
 /*
  *	xpadone_process_packet
@@ -878,10 +928,28 @@ static void xpadone_process_packet(struct usb_xpad *xpad, u16 cmd, unsigned char
 		input_report_key(dev, BTN_MODE, data[4] & 0x01);
 		input_sync(dev);
 		return;
-	}
-	/* check invalid packet */
-	else if (data[0] != 0X20)
+	} else if (data[0] == 0x4d) {
+		/* Elite controller profile data packet */
+		xpadone_process_profile_packet(xpad, data);
 		return;
+	/* check invalid packet */
+	} else if (data[0] != 0X20) {
+		return;
+	}
+
+	if (xpad->mapping & MAP_BACK_PADDLES)
+	{
+		int elite_profile = data[32] >> 4; /* profile number is just the switch position */
+		if (!xpad->elite_profiles[elite_profile].base_btn_map)
+			input_report_key(dev, BTN_BASE, data[32] & 0x01);
+		if (!xpad->elite_profiles[elite_profile].base2_btn_map)
+			input_report_key(dev, BTN_BASE2, data[32] & 0x02);
+		if (!xpad->elite_profiles[elite_profile].base3_btn_map)
+			input_report_key(dev, BTN_BASE3, data[32] & 0x04);
+		if (!xpad->elite_profiles[elite_profile].base4_btn_map)
+			input_report_key(dev, BTN_BASE4, data[32] & 0x08);
+	}
+
 
 	/* menu/view buttons */
 	input_report_key(dev, BTN_START,  data[4] & 0x04);
@@ -1192,6 +1260,28 @@ static void xpad_deinit_output(struct usb_xpad *xpad)
 	}
 }
 
+
+static int xpadone_get_profile_data(struct usb_xpad *xpad, int profile_num)
+{
+        struct xpad_output_packet *packet = &xpad->out_packets[XPAD_OUT_CMD_IDX];
+        unsigned long flags;
+        int retval;
+        spin_lock_irqsave(&xpad->odata_lock, flags);
+        packet->data[0] = 0x4d;
+        packet->data[1] = 0x10;
+        packet->data[2] = profile_num+10;
+        packet->data[3] = 0x03;
+        packet->data[4] = 0x02;
+        packet->data[5] = 0x1d + profile_num;
+        packet->data[6] = 0x37;
+        packet->len = 7;
+        packet->pending = true;
+        xpad_try_sending_next_out_packet(xpad);
+        spin_unlock_irqrestore(&xpad->odata_lock, flags);
+        return retval;
+}
+
+
 static int xpad_inquiry_pad_presence(struct usb_xpad *xpad)
 {
 	struct xpad_output_packet *packet =
@@ -1229,6 +1319,11 @@ static int xpad_start_xbox_one(struct usb_xpad *xpad)
 {
 	unsigned long flags;
 	int retval;
+
+	if (xpad->mapping & MAP_BACK_PADDLES)
+	{
+		xpadone_get_profile_data(xpad, 0);
+	}
 
 	spin_lock_irqsave(&xpad->odata_lock, flags);
 
@@ -1804,6 +1899,12 @@ static int xpad_init_input(struct usb_xpad *xpad)
 	} else {
 		for (i = 0; xpad_btn[i] >= 0; i++)
 			input_set_capability(input_dev, EV_KEY, xpad_btn[i]);
+	}
+
+	if (xpad->mapping & MAP_BACK_PADDLES)
+	{
+		for (i = 0; xpadelite_btn_paddles[i] >= 0; i++)
+			input_set_capability(input_dev, EV_KEY, xpadelite_btn_paddles[i]);
 	}
 
 	if (xpad->mapping & MAP_DPAD_TO_BUTTONS) {
